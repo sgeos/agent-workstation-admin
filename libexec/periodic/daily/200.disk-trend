@@ -1,0 +1,59 @@
+#!/bin/sh
+# Report free and used space on the data volume and any build-output volume,
+# and the change in used space since the previous daily run.
+#
+# This is the daily early warning for disk growth. It reads df, which costs
+# nothing, where the weekly 350.build-growth job walks folders with du to say
+# which one grew. Health Alert warns on free space itself; this job warns on
+# fast growth, which comes first. A build-output volume in the same APFS
+# container as the data volume draws on the same pool of free space.
+#
+# Settings, from ~/.config/periodic.conf when it exists:
+#   PERIODIC_DISK_GROWTH_GB  daily growth of the volumes' used space, in GB,
+#                            that counts as a finding (20)
+#   PERIODIC_DISK_VOLUMES    the volumes to measure, separated by spaces
+#                            (/System/Volumes/Data /Volumes/Scratch). A listed
+#                            volume whose folder does not exist is skipped
+#                            with a note, so the default suits a machine
+#                            without a scratch volume.
+#
+# Failure modes: a volume that df cannot read is reported as ATTENTION and
+# skipped, rather than treated as zero.
+
+set -u
+
+growth_gb=${PERIODIC_DISK_GROWTH_GB:-20}
+state_dir=${PERIODIC_STATE_DIR:-${HOME}/Library/Caches/local.periodic}
+prev=${state_dir}/disk.prev
+now=${state_dir}/disk.now
+mkdir -p "$state_dir"
+: > "$now"
+
+# Split on spaces on purpose: one argument per volume.
+# shellcheck disable=SC2086
+for vol in ${PERIODIC_DISK_VOLUMES:-/System/Volumes/Data /Volumes/Scratch}; do
+    if [ ! -d "$vol" ]; then
+        echo "  ${vol} is not present, skipped"
+        continue
+    fi
+    line=$(df -k "$vol" 2>/dev/null | awk 'NR == 2 { print $3, $4 }')
+    if [ -z "$line" ]; then
+        echo "ATTENTION: df could not read ${vol}"
+        continue
+    fi
+    set -- $line
+    printf '%s\t%s\t%s\n' "$vol" "$1" "$2" >> "$now"
+    printf '  %-22s %6.1f GB used, %6.1f GB free\n' "$vol" \
+        "$(awk -v k="$1" 'BEGIN { print k / 1048576 }')" "$(awk -v k="$2" 'BEGIN { print k / 1048576 }')"
+done
+
+if [ -r "$prev" ]; then
+    delta_kb=$(awk -F'\t' 'NR == FNR { before[$1] = $2; next } ($1 in before) { d += $2 - before[$1] } END { print d + 0 }' "$prev" "$now")
+    printf '  Used space changed by %+.1f GB since the previous run\n' "$(awk -v k="$delta_kb" 'BEGIN { print k / 1048576 }')"
+    [ "$delta_kb" -ge $((growth_gb * 1048576)) ] &&
+        echo "ATTENTION: used disk space grew $(awk -v k="$delta_kb" 'BEGIN { printf "%.1f", k / 1048576 }') GB in a day; the weekly build-growth report names the folders"
+else
+    echo "  No previous run to compare with; growth is reported from the next run."
+fi
+mv "$now" "$prev"
+exit 0

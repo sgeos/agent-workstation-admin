@@ -1,0 +1,24 @@
+# Citation metadata, read by GitHub's "Cite this repository" button and by reference
+# managers. Add `version` and `date-released` at the first release, and keep them
+# current with each later one.
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "agent-workstation-admin"
+abstract: >
+  A small toolkit for administering a macOS workstation that runs many AI
+  coding-agent sessions at once, with launchd health alerts, a machine-status
+  file that agents can read, report-only periodic jobs, log rotation, a session
+  inventory and a configuration collector with secret scanning.
+authors:
+  - family-names: "Sechter"
+    given-names: "Brendan A R"
+url: "https://github.com/sgeos/agent-workstation-admin"
+repository-code: "https://github.com/sgeos/agent-workstation-admin"
+license: "0BSD"
+type: software
+keywords:
+  - "macos"
+  - "launchd"
+  - "system-administration"
+  - "ai-agents"
+  - "monitoring"

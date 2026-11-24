@@ -1,0 +1,178 @@
+#!/bin/sh
+# Report available updates for macOS, MacPorts or Homebrew, the agent
+# harnesses, npm globals, Rust toolchains, uv tools and cargo binaries.
+#
+# A machine that runs long agent sessions often has automatic macOS installs
+# turned off, so that it never restarts by itself, which means updates wait
+# until someone looks. MacPorts is checked against its last synced index,
+# because refreshing the index needs sudo; run `sudo port selfupdate` to
+# refresh it. A tool that is not installed is noted and skipped, not flagged.
+
+set -u
+
+echo "macOS:"
+updates=$(softwareupdate -l 2>&1)
+labels=$(printf '%s\n' "$updates" | sed -n 's/^\* Label: //p')
+if [ -n "$labels" ]; then
+    printf '%s\n' "$labels" | while IFS= read -r label; do
+        echo "ATTENTION: macOS update available: ${label}"
+    done
+elif printf '%s\n' "$updates" | grep -q 'No new software available'; then
+    echo "  up to date"
+else
+    echo "ATTENTION: softwareupdate gave no usable answer"
+fi
+
+echo
+echo "MacPorts:"
+if command -v port >/dev/null 2>&1; then
+    outdated=$(port -q outdated 2>/dev/null)
+    if [ -n "$outdated" ]; then
+        printf '%s\n' "$outdated" | while IFS= read -r line; do
+            echo "ATTENTION: outdated port: ${line}"
+        done
+    else
+        echo "  no outdated ports in the last synced index"
+    fi
+    synced=$(stat -f '%Sm' -t '%Y-%m-%d' /opt/local/var/macports/sources/rsync.macports.org/macports/release/tarballs/ports 2>/dev/null || echo unknown)
+    echo "  index last synced: ${synced}"
+else
+    echo "  MacPorts is not installed"
+fi
+
+echo
+echo "Homebrew:"
+if command -v brew >/dev/null 2>&1; then
+    # Like MacPorts, this reads the last fetched index and does not update it.
+    outdated=$(HOMEBREW_NO_AUTO_UPDATE=1 brew outdated --quiet 2>/dev/null)
+    if [ -n "$outdated" ]; then
+        printf '%s\n' "$outdated" | while IFS= read -r line; do
+            echo "ATTENTION: outdated formula or cask: ${line}"
+        done
+    else
+        echo "  nothing outdated in the last fetched index"
+    fi
+else
+    echo "  Homebrew is not installed"
+fi
+
+# Everything below was added after an update sweep found the harnesses, npm
+# globals, Rust nightly, uv tools and most cargo binaries out of date, none of
+# which this report covered. Each check only reads. A check that cannot run
+# says so instead of reporting "up to date". scripts/collect.sh records the
+# installed versions in software-versions.txt, so a private repository that
+# keeps its output has a history of what was updated when.
+PATH=${PATH}:${HOME}/.cargo/bin
+
+echo
+echo "Agent harnesses:"
+if command -v claude >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    have=$(claude --version 2>/dev/null | awk '{ print $1 }')
+    want=$(npm view @anthropic-ai/claude-code version 2>/dev/null)
+    if [ -z "$have" ] || [ -z "$want" ]; then
+        echo "ATTENTION: could not compare Claude Code versions (installed '${have}', latest '${want}')"
+    elif [ "$have" != "$want" ]; then
+        echo "ATTENTION: Claude Code ${have} installed, ${want} available"
+    else
+        echo "  Claude Code ${have}, current"
+    fi
+else
+    echo "  claude or npm not found, so Claude Code was not checked"
+fi
+if command -v codex >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    have=$(codex --version 2>/dev/null | awk '{ print $NF }')
+    want=$(npm view @openai/codex version 2>/dev/null)
+    if [ -z "$have" ] || [ -z "$want" ]; then
+        echo "ATTENTION: could not compare Codex versions (installed '${have}', latest '${want}')"
+    elif [ "$have" != "$want" ]; then
+        echo "ATTENTION: Codex ${have} installed, ${want} available"
+    else
+        echo "  Codex ${have}, current"
+    fi
+else
+    echo "  codex or npm not found, so Codex was not checked"
+fi
+if command -v grok >/dev/null 2>&1; then
+    answer=$(grok update --check 2>&1 | tail -1)
+    case $answer in
+        *"new version"*) echo "ATTENTION: Grok Build: ${answer}" ;;
+        "") echo "ATTENTION: grok update --check gave no answer" ;;
+        *) echo "  Grok Build: ${answer}" ;;
+    esac
+else
+    echo "  grok not found, so Grok Build was not checked"
+fi
+echo "  Running sessions keep the version they started with; a resume picks up the new one."
+
+echo
+echo "npm globals:"
+if command -v npm >/dev/null 2>&1; then
+    outdated=$(npm outdated -g --parseable 2>/dev/null)
+    if [ -n "$outdated" ]; then
+        # Parseable lines read path:wanted:current:latest:dependent.
+        printf '%s\n' "$outdated" | awk -F: '{ n = $2; sub(/@[^@]*$/, "", n); c = $3; sub(/.*@/, "", c); l = $4; sub(/.*@/, "", l); print "ATTENTION: npm global " n " " c " installed, " l " available" }'
+    else
+        echo "  current"
+    fi
+else
+    echo "  npm not found, so npm globals were not checked"
+fi
+
+echo
+echo "Rust toolchains:"
+if command -v rustup >/dev/null 2>&1; then
+    rustup check 2>/dev/null | while IFS= read -r line; do
+        case $line in
+            *"update available"*) echo "ATTENTION: rustup: ${line}" ;;
+            *) echo "  ${line}" ;;
+        esac
+    done
+else
+    echo "  rustup not found, so Rust toolchains were not checked"
+fi
+
+echo
+echo "uv tools:"
+# uv may be installed under ~/Library/Python/<version>/bin, outside the job's PATH.
+# The glob sorts by name, so the last match is the newest Python's copy.
+uv=$(command -v uv 2>/dev/null || true)
+if [ -z "$uv" ]; then
+    for candidate in "${HOME}"/Library/Python/*/bin/uv; do
+        [ -x "$candidate" ] && uv=$candidate
+    done
+fi
+if [ -n "$uv" ] && [ -x "$uv" ]; then
+    "$uv" tool list --outdated 2>/dev/null | sed -n 's/^\([^ ]*\) v\([^ ]*\) \[latest: \([^]]*\)\]/ATTENTION: uv tool \1 \2 installed, \3 available/p'
+    # The backticks are literal: uv quotes the tool name with them.
+    # shellcheck disable=SC2016
+    broken=$("$uv" tool list 2>&1 | sed -n 's/.*Tool `\([^`]*\)` environment not found.*/\1/p')
+    [ -n "$broken" ] && printf '%s\n' "$broken" | while IFS= read -r t; do
+        echo "ATTENTION: uv tool ${t} has a broken environment; reinstall it"
+    done
+    echo "  checked with ${uv}"
+else
+    echo "  uv not found, so uv tools were not checked"
+fi
+
+echo
+echo "cargo binaries (from crates.io; git and path installs are skipped):"
+checker=$(command -v cargo-outdated-check 2>/dev/null || echo "${HOME}/.local/bin/cargo-outdated-check")
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "  cargo not found, so cargo binaries were not checked"
+elif [ -x "$checker" ]; then
+    stale=$(python3 -I "$checker" 2>&1)
+    if [ -n "$stale" ]; then
+        printf '%s\n' "$stale" | while read -r name have want; do
+            if [ "$want" = "?" ]; then
+                echo "ATTENTION: cargo ${name}: crates.io lookup failed"
+            else
+                echo "ATTENTION: cargo ${name} ${have} installed, ${want} available"
+            fi
+        done
+        echo "  A project may pin some of these binaries to a version. Check before updating them."
+    else
+        echo "  current"
+    fi
+else
+    echo "ATTENTION: cargo-outdated-check not found, so cargo binaries were not checked"
+fi

@@ -1,0 +1,30 @@
+#!/bin/sh
+# Report how much disk the LLM harnesses' session logs use, and any single log
+# file over PERIODIC_HARNESS_FILE_GB.
+#
+# Claude Code and Codex keep every session transcript, and on 2026-10-30 one
+# Codex transcript alone had reached 2 GB. The report only measures. Old
+# transcripts are what resume reads, so deleting them is a decision for the
+# operator.
+
+set -u
+
+file_gb=${PERIODIC_HARNESS_FILE_GB:-1}
+total_gb=${PERIODIC_HARNESS_TOTAL_GB:-20}
+total=0
+
+for dir in "${HOME}/.codex/sessions" "${HOME}/.claude/projects" "${HOME}/.grok/sessions"; do
+    [ -d "$dir" ] || continue
+    kb=$(du -sk "$dir" 2>/dev/null | awk '{ print $1 }')
+    total=$((total + kb))
+    awk -v kb="$kb" -v d="${dir#"${HOME}"/}" 'BEGIN { printf "  %8.1f GB  ~/%s\n", kb / 1048576, d }'
+    find "$dir" -type f -size +"${file_gb}"G 2>/dev/null | while IFS= read -r file; do
+        size=$(du -sk "$file" | awk '{ printf "%.1f", $1 / 1048576 }')
+        echo "ATTENTION: ${size} GB log ~/${file#"${HOME}"/}"
+    done
+done
+
+awk -v kb="$total" 'BEGIN { printf "  %8.1f GB  in total\n", kb / 1048576 }'
+[ "$total" -ge $((total_gb * 1048576)) ] &&
+    echo "ATTENTION: harness logs use more than ${total_gb} GB"
+exit 0

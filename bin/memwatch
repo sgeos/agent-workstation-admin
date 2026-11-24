@@ -1,0 +1,280 @@
+#!/bin/bash
+# memwatch: periodic memory, swap, and disk headroom check for long uptimes.
+#
+# Run hourly by the LaunchAgent ~/Library/LaunchAgents/local.memwatch.plist.
+# Each run appends one summary line to the log, and posts a macOS notification
+# for each threshold breached. A breach of the same kind is notified at most
+# once per cooldown period, so a sustained condition does not spam.
+#
+# Rationale: on 2026-10-23 this machine ran out of application memory after
+# 53 days of uptime. Swap had reached 6 GB with about 33 GB of disk free, and
+# macOS paused Ghostty. Leaking system agents (ControlCenter, WiFiAgent,
+# fileproviderd) and many long-running agent sessions were the main consumers.
+# This job exists to give warning while recovery is still cheap.
+#
+# Thresholds are overridable through the environment, for testing:
+#   MEMWATCH_SWAP_MB        swap used, in MB, above which to warn (4096)
+#   MEMWATCH_PROC_MB        single process memory, in MB, above which to warn (1024)
+#   MEMWATCH_DISK_GB        free space on the Data volume, in GB, below which to warn (50)
+#   MEMWATCH_FREE_PCT       system-wide memory free percent below which to warn (20)
+#   MEMWATCH_COOLDOWN_S     seconds between repeat notifications of one kind (21600)
+#   MEMWATCH_NOTIFY         set to 0 to log only, with no notifications (1)
+#   MEMWATCH_STATE_DIR      cooldown state directory
+#   MEMWATCH_LOG            log file path
+#
+# Failure modes: if a measurement cannot be read or parsed, the run logs an
+# ERROR for that measurement, skips its check, and exits nonzero, rather than
+# treating the missing value as healthy or as a breach. Notifications go
+# through osascript, which only works inside a logged-in GUI session.
+#
+# Trust boundary: all inputs are local command output (sysctl, top, df,
+# memory_pressure). Process names from top are only logged and shown in a
+# notification. They are sanitized before being placed in AppleScript source.
+#
+# Compatible with macOS /bin/bash 3.2, so no associative arrays.
+
+set -u
+set -o pipefail
+
+readonly SWAP_MB="${MEMWATCH_SWAP_MB:-4096}"
+readonly PROC_MB="${MEMWATCH_PROC_MB:-1024}"
+readonly DISK_GB="${MEMWATCH_DISK_GB:-50}"
+readonly FREE_PCT="${MEMWATCH_FREE_PCT:-20}"
+readonly COOLDOWN_S="${MEMWATCH_COOLDOWN_S:-21600}"
+readonly NOTIFY="${MEMWATCH_NOTIFY:-1}"
+readonly STATE_DIR="${MEMWATCH_STATE_DIR:-$HOME/Library/Application Support/memwatch}"
+readonly LOG="${MEMWATCH_LOG:-$HOME/Library/Logs/memwatch.log}"
+# Health Alert writes one memory sample per run, every ten minutes, so a stale
+# sample log means Health Alert has stopped. Added 2026-11-18 so that the two
+# monitors watch each other; Health Alert checks this script's log in turn.
+readonly HEALTH_LOG="${MEMWATCH_HEALTH_LOG:-$HOME/Library/Logs/health-alert-memory.log}"
+readonly HEALTH_STALE_S="${MEMWATCH_HEALTH_STALE_S:-1800}"
+readonly LOG_MAX_LINES=5000
+readonly TOP_N=15
+
+# Core macOS processes that are large by design. A breach by one of these is
+# still logged, but not notified, because restarting them is not an option.
+readonly CORE_PROCS=" kernel_task WindowServer launchd "
+
+errors=0
+warnings=0
+
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_config() {
+    local name value
+    for name in SWAP_MB PROC_MB DISK_GB FREE_PCT COOLDOWN_S HEALTH_STALE_S; do
+        value="${!name}"
+        if ! is_uint "$value"; then
+            echo "memwatch: $name must be a non-negative integer, got '$value'" >&2
+            exit 2
+        fi
+    done
+    if [ "$FREE_PCT" -gt 100 ]; then
+        echo "memwatch: FREE_PCT must be at most 100, got '$FREE_PCT'" >&2
+        exit 2
+    fi
+}
+
+log_line() {
+    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$LOG"
+}
+
+warn_line() {
+    warnings=$((warnings + 1))
+    log_line "WARN $1"
+}
+
+# Keep the log bounded. Trimming happens only when the cap is exceeded.
+trim_log() {
+    local lines tmp
+    [ -f "$LOG" ] || return 0
+    lines=$(wc -l < "$LOG" | tr -d ' ')
+    if is_uint "$lines" && [ "$lines" -gt "$LOG_MAX_LINES" ]; then
+        tmp="$LOG.tmp.$$"
+        tail -n "$LOG_MAX_LINES" "$LOG" > "$tmp" && mv "$tmp" "$LOG"
+    fi
+}
+
+# Convert a size such as 512K, 1672M, 1.2G, or 0.00M to whole megabytes.
+# Prints nothing and fails on input it does not recognize.
+to_mb() {
+    printf '%s\n' "$1" | awk '
+        /^[0-9]+(\.[0-9]+)?[BKMGT]$/ {
+            n = substr($0, 1, length($0) - 1) + 0
+            u = substr($0, length($0), 1)
+            if (u == "B") n = n / 1048576
+            else if (u == "K") n = n / 1024
+            else if (u == "G") n = n * 1024
+            else if (u == "T") n = n * 1048576
+            printf "%d\n", n
+            ok = 1
+        }
+        END { exit ok ? 0 : 1 }'
+}
+
+# Strip anything that could break out of an AppleScript string literal.
+sanitize() {
+    printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._:,()/%-'
+}
+
+# Notify once per key per cooldown. The key names a file in STATE_DIR.
+notify() {
+    local key="$1" message="$2" stamp now last
+    [ "$NOTIFY" = "1" ] || return 0
+    stamp="$STATE_DIR/last-$key"
+    now=$(date +%s)
+    last=0
+    if [ -f "$stamp" ]; then
+        last=$(cat "$stamp" 2>/dev/null || echo 0)
+        is_uint "$last" || last=0
+    fi
+    if [ $((now - last)) -lt "$COOLDOWN_S" ]; then
+        return 0
+    fi
+    message=$(sanitize "$message")
+    if osascript -e "display notification \"$message\" with title \"memwatch\" sound name \"Funk\"" >/dev/null 2>&1; then
+        printf '%s\n' "$now" > "$stamp"
+    else
+        log_line "ERROR notification failed for $key"
+        errors=$((errors + 1))
+    fi
+}
+
+check_swap() {
+    local raw used_tok used_mb
+    raw=$(sysctl -n vm.swapusage 2>/dev/null) || raw=""
+    # Expected form: total = 6144.00M  used = 5178.25M  free = 965.75M  (encrypted)
+    used_tok=$(printf '%s\n' "$raw" | sed -n 's/.*used = \([0-9.]*[KMGT]\).*/\1/p')
+    if [ -z "$used_tok" ] || ! used_mb=$(to_mb "$used_tok"); then
+        log_line "ERROR swap unreadable: '$raw'"
+        errors=$((errors + 1))
+        SUMMARY="$SUMMARY swap=?"
+        return
+    fi
+    SUMMARY="$SUMMARY swap=${used_mb}MB"
+    if [ "$used_mb" -gt "$SWAP_MB" ]; then
+        warn_line "swap ${used_mb}MB exceeds ${SWAP_MB}MB"
+        notify swap "Swap at ${used_mb} MB, limit ${SWAP_MB} MB. Quit idle sessions or restart leaking agents."
+    fi
+}
+
+check_free_pct() {
+    local pct
+    pct=$(memory_pressure 2>/dev/null | sed -n 's/.*free percentage: \([0-9]*\)%.*/\1/p')
+    if ! is_uint "$pct"; then
+        log_line "ERROR memory free percentage unreadable"
+        errors=$((errors + 1))
+        SUMMARY="$SUMMARY free=?"
+        return
+    fi
+    SUMMARY="$SUMMARY free=${pct}%"
+    if [ "$pct" -lt "$FREE_PCT" ]; then
+        warn_line "memory free ${pct}% below ${FREE_PCT}%"
+        notify freepct "Memory free at ${pct} percent, limit ${FREE_PCT} percent."
+    fi
+}
+
+check_disk() {
+    local avail_kb avail_gb
+    avail_kb=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR == 2 { print $4 }')
+    if ! is_uint "$avail_kb"; then
+        log_line "ERROR disk free unreadable"
+        errors=$((errors + 1))
+        SUMMARY="$SUMMARY disk=?"
+        return
+    fi
+    avail_gb=$((avail_kb / 1048576))
+    SUMMARY="$SUMMARY disk=${avail_gb}GB"
+    if [ "$avail_gb" -lt "$DISK_GB" ]; then
+        warn_line "disk free ${avail_gb}GB below ${DISK_GB}GB"
+        notify disk "Disk free at ${avail_gb} GB, limit ${DISK_GB} GB. Low disk limits swap growth."
+    fi
+}
+
+check_processes() {
+    local out line pid name mem_tok mem_mb big="" count=0
+    # top truncates command names to 16 characters. The trailing +, -, or *
+    # on the MEM column marks change since the previous sample and is removed.
+    if ! out=$(top -l 1 -o mem -n "$TOP_N" -stats pid,mem,command 2>/dev/null | awk '/^PID/ { f = 1; next } f && NF >= 3'); then
+        log_line "ERROR process list unreadable"
+        errors=$((errors + 1))
+        return
+    fi
+    while IFS= read -r line; do
+        pid=$(printf '%s\n' "$line" | awk '{ print $1 }')
+        mem_tok=$(printf '%s\n' "$line" | awk '{ print $2 }' | tr -d '+-*')
+        name=$(printf '%s\n' "$line" | awk '{ $1 = ""; $2 = ""; sub(/^  /, ""); print }')
+        is_uint "$pid" || continue
+        mem_mb=$(to_mb "$mem_tok") || continue
+        count=$((count + 1))
+        if [ "$mem_mb" -gt "$PROC_MB" ]; then
+            warn_line "process $name pid=$pid ${mem_mb}MB exceeds ${PROC_MB}MB"
+            case "$CORE_PROCS" in
+                *" $name "*) ;;
+                *) big="$big ${name} ${mem_mb}MB," ;;
+            esac
+        fi
+    done <<EOF
+$out
+EOF
+    if [ "$count" -eq 0 ]; then
+        log_line "ERROR process list parsed no rows"
+        errors=$((errors + 1))
+        return
+    fi
+    if [ -n "$big" ]; then
+        notify procs "Large processes:${big%,}"
+    fi
+}
+
+check_health_alert() {
+    local mtime age
+    if [ ! -e "$HEALTH_LOG" ]; then
+        warn_line "health-alert memory log missing at $HEALTH_LOG"
+        notify healthalert "Health Alert has written no samples. Check its LaunchAgent."
+        return
+    fi
+    mtime=$(stat -f %m "$HEALTH_LOG" 2>/dev/null) || mtime=""
+    if ! is_uint "$mtime"; then
+        log_line "ERROR health-alert log age unreadable"
+        errors=$((errors + 1))
+        return
+    fi
+    age=$(( $(date +%s) - mtime ))
+    if [ "$age" -gt "$HEALTH_STALE_S" ]; then
+        warn_line "health-alert last sampled ${age}s ago, limit ${HEALTH_STALE_S}s"
+        notify healthalert "Health Alert last ran $((age / 60)) minutes ago. Check its LaunchAgent."
+    fi
+}
+
+main() {
+    validate_config
+    mkdir -p "$STATE_DIR" "$(dirname "$LOG")" || exit 3
+    SUMMARY=""
+    check_swap
+    check_free_pct
+    check_disk
+    check_processes
+    check_health_alert
+    if [ "$errors" -gt 0 ]; then
+        SUMMARY="ERRORS=$errors$SUMMARY"
+    elif [ "$warnings" -gt 0 ]; then
+        SUMMARY="WARNINGS=$warnings$SUMMARY"
+    else
+        SUMMARY="OK$SUMMARY"
+    fi
+    log_line "$SUMMARY"
+    trim_log
+    [ "$errors" -eq 0 ]
+}
+
+# Run only when executed, so tests can source the functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

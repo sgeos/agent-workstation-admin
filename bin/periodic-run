@@ -1,0 +1,102 @@
+#!/bin/sh
+# Run the daily, weekly or monthly report jobs, in the manner of FreeBSD's
+# periodic(8).
+#
+# Usage: periodic-run daily|weekly|monthly
+#
+# Runs every executable in ~/.local/libexec/periodic/<frequency>/ in name
+# order, at low priority, and writes their combined report to
+# ~/Library/Logs/periodic/<frequency>.out, replacing the last one, and appends
+# it to <frequency>.log, which newsyslog rotates. The jobs only report. None
+# of them deletes, upgrades, commits or pushes anything.
+#
+# A job flags a finding by printing a line that starts with "ATTENTION:". A job
+# that exits nonzero is flagged too. When a report holds any flagged line, a
+# summary goes on the Health Alert queue and Health Alert is started, so the
+# notification appears within seconds.
+#
+# Settings may be overridden in ~/.config/periodic.conf, a shell file of
+# variable assignments read before the jobs run. PERIODIC_CONF names another
+# file. The file is executed as shell, so it must be owned by the user and not
+# writable by others; it carries the same trust as ~/.profile.
+#
+# Locations, each overridable from the environment or periodic.conf, which is
+# how the tests run this script against temporary folders:
+#   PERIODIC_JOB_DIR    the job folders           (~/.local/libexec/periodic)
+#   PERIODIC_LOG_DIR    the reports               (~/Library/Logs/periodic)
+#   PERIODIC_STATE_DIR  locks and job state       (~/Library/Caches/local.periodic)
+#   PERIODIC_QUEUE      Health Alert's queue      (~/Library/Caches/local.health-alert/queue)
+#   PERIODIC_KICKSTART  0 to not start Health Alert after queueing (1)
+#
+# Exit status: 0 when the report was written, 1 when another run of the same
+# frequency is in progress, and 2 on a usage error.
+
+set -u
+
+usage() {
+    echo "usage: periodic-run daily|weekly|monthly" >&2
+    exit 2
+}
+
+[ $# -eq 1 ] || usage
+case $1 in daily|weekly|monthly) freq=$1 ;; *) usage ;; esac
+
+conf=${PERIODIC_CONF:-${HOME}/.config/periodic.conf}
+# set -a exports every assignment in the file, because the jobs are separate
+# processes and would not otherwise see settings such as PERIODIC_PROJECTS.
+if [ -r "$conf" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$conf"
+    set +a
+fi
+
+job_dir=${PERIODIC_JOB_DIR:-${HOME}/.local/libexec/periodic}/${freq}
+log_dir=${PERIODIC_LOG_DIR:-${HOME}/Library/Logs/periodic}
+state_dir=${PERIODIC_STATE_DIR:-${HOME}/Library/Caches/local.periodic}
+queue=${PERIODIC_QUEUE:-${HOME}/Library/Caches/local.health-alert/queue}
+
+mkdir -p "$log_dir" "$state_dir" "$(dirname "$queue")"
+# The jobs keep their own state, such as the previous disk sizes, here too.
+export PERIODIC_STATE_DIR="$state_dir"
+
+# mkdir is atomic, so it serves as a lock against overlapping runs.
+lock=${state_dir}/${freq}.lock
+if ! mkdir "$lock" 2>/dev/null; then
+    echo "periodic-run: a ${freq} run is already in progress (${lock})" >&2
+    exit 1
+fi
+report=$(mktemp "${state_dir}/${freq}.XXXXXX")
+trap 'rm -rf "$lock" "$report"' EXIT HUP INT TERM
+
+{
+    echo "${freq} report for $(hostname -s), $(date '+%Y-%m-%d %H:%M %Z')"
+    found=false
+    for job in "$job_dir"/*; do
+        [ -f "$job" ] && [ -x "$job" ] || continue
+        found=true
+        name=$(basename "$job")
+        echo
+        echo "== ${name}"
+        start=$(date +%s)
+        rc=0
+        nice -n 10 "$job" 2>&1 || rc=$?
+        [ "$rc" -eq 0 ] || echo "ATTENTION: ${name} exited with status ${rc}"
+        echo "(${name} took $(( $(date +%s) - start )) s)"
+    done
+    [ "$found" = true ] || echo "ATTENTION: no jobs found in ${job_dir}"
+} > "$report"
+
+cat "$report" >> "${log_dir}/${freq}.log"
+echo >> "${log_dir}/${freq}.log"
+cp "$report" "${log_dir}/${freq}.out"
+
+flagged=$(grep -c '^ATTENTION:' "$report" || true)
+if [ "$flagged" -gt 0 ]; then
+    printf '%s|%s\n' "${freq} report" \
+        "${flagged} findings need attention. See ${log_dir}/${freq}.out." >> "$queue"
+    if [ "${PERIODIC_KICKSTART:-1}" != 0 ]; then
+        launchctl kickstart "gui/$(id -u)/local.health-alert" >/dev/null 2>&1 || true
+    fi
+fi
+exit 0

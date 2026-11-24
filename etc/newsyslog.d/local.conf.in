@@ -1,0 +1,23 @@
+# Rotate the toolkit's own logs, as newsyslog does for system logs.
+#
+# A template. The newsyslog section of scripts/install.sh fills in the HOME
+# and USER placeholders with the target account's home folder and user name,
+# and installs the result as /etc/newsyslog.d/local.conf. Check it afterwards
+# with:
+#   sudo newsyslog -nv | grep -E 'health-alert|periodic'
+#
+# The memory log gains about 16 KB a day, so 1 MB holds about two months and
+# twelve archives about two years.
+# Fields: path, owner:group, mode, archives kept, size in KB, time, flags.
+# J compresses archives with bzip2. N sends no signal, since each log is
+# opened afresh by every run. The periodic logs also rotate monthly ($M1D0,
+# midnight on the first), so a quiet log does not keep years of reports.
+# Logs that a long-running service holds open are not listed here. They are
+# rotated by bin/rotate-logs, which copies and then truncates.
+# logfilename                                  [owner:group]  mode count size when  flags
+@HOME@/Library/Logs/health-alert.log           @USER@:staff   644  7     1024 *     JN
+@HOME@/Library/Logs/health-alert-memory.log    @USER@:staff   644  12    1024 *     JN
+@HOME@/Library/Logs/periodic/daily.log         @USER@:staff   644  12    4096 $M1D0 JN
+@HOME@/Library/Logs/periodic/weekly.log        @USER@:staff   644  12    4096 $M1D0 JN
+@HOME@/Library/Logs/periodic/monthly.log       @USER@:staff   644  12    1024 $M1D0 JN
+@HOME@/Library/Logs/periodic/launchd.log       @USER@:staff   644  4     1024 *     JN

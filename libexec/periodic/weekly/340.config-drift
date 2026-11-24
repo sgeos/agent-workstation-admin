@@ -1,0 +1,79 @@
+#!/bin/sh
+# Report configuration that has changed since it was last recorded by
+# scripts/collect.sh, and whether the repository holding that record has
+# unrecorded work.
+#
+# Settings, from ~/.config/periodic.conf when it exists. Both must be set, or
+# the job notes that it is not configured and does nothing else:
+#   PERIODIC_COLLECT     the path of collect.sh, in a checkout of this toolkit
+#   PERIODIC_RECORD_DIR  the folder that collect.sh last wrote into, such as
+#                        the machine/ folder of a private repository
+#
+# collect.sh writes into a temporary folder here, never into the record, so
+# this job cannot disturb a session working in that repository. To record the
+# drift, run collect.sh with COLLECT_DEST set to the record, review the diff
+# and commit.
+
+set -u
+
+collect=${PERIODIC_COLLECT:-}
+record=${PERIODIC_RECORD_DIR:-}
+if [ -z "$collect" ] || [ -z "$record" ]; then
+    echo "  PERIODIC_COLLECT and PERIODIC_RECORD_DIR are not both set, so drift was not checked"
+    exit 0
+fi
+if [ ! -r "$collect" ]; then
+    echo "ATTENTION: ${collect} not found"
+    exit 0
+fi
+if [ ! -d "${record}/home" ]; then
+    echo "ATTENTION: ${record} holds no earlier collection; run collect.sh into it first"
+    exit 0
+fi
+
+tmp=$(mktemp -d)
+err=$(mktemp)
+trap 'rm -rf "$tmp" "$err"' EXIT
+
+if ! COLLECT_DEST="$tmp" sh "$collect" >/dev/null 2>"$err"; then
+    echo "ATTENTION: collect.sh failed: $(head -1 "$err")"
+    exit 0
+fi
+
+# Compare only what collect.sh writes: home/ and the generated lists.
+drift=$( { diff -rq "${record}/home" "${tmp}/home" 2>&1
+           for list in "$tmp"/*.txt; do
+               name=$(basename "$list")
+               cmp -s "$list" "${record}/${name}" || echo "Files differ: ${name}"
+           done; } | sed "s#${tmp}#<live>#g; s#${record}/##g")
+if [ -n "$drift" ]; then
+    printf '%s\n' "$drift" | while IFS= read -r line; do
+        echo "ATTENTION: drift: ${line}"
+    done
+else
+    echo "  recorded configuration matches the machine"
+fi
+
+# Name the software that changed, not only the file, so that an update or a
+# removal since the last recorded state can be read here directly. At most 60
+# lines; the full difference is in git diff after running collect.sh.
+recorded=${record}/software-versions.txt
+if [ -r "$recorded" ] && [ -r "${tmp}/software-versions.txt" ] &&
+    ! cmp -s "$recorded" "${tmp}/software-versions.txt"; then
+    echo
+    echo "Software changed since the recorded versions (- recorded, + now):"
+    diff "$recorded" "${tmp}/software-versions.txt" | sed -n 's/^< /  - /p; s/^> /  + /p' | head -60
+fi
+
+# The record is normally kept in git. If it is, report unpushed and
+# uncommitted work there too.
+export GIT_OPTIONAL_LOCKS=0
+if git -C "$record" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    state=$(git -C "$record" status --porcelain --branch 2>/dev/null | head -1)
+    case $state in
+        *ahead*) echo "ATTENTION: the record's repository has unpushed commits: ${state#\#\# }" ;;
+    esac
+    changes=$(git -C "$record" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    [ "$changes" -gt 0 ] && echo "ATTENTION: the record's repository has ${changes} uncommitted changes"
+fi
+exit 0

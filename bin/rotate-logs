@@ -1,0 +1,152 @@
+#!/bin/sh
+# rotate-logs: rotate logs that a long-running launchd service holds open.
+#
+# Run daily by ~/Library/LaunchAgents/local.rotate-logs.plist. newsyslog,
+# through /etc/newsyslog.d/local.conf, rotates the logs that each run opens afresh,
+# such as Health Alert's and the periodic reports'. It cannot rotate a log that
+# a running service keeps open, because moving the file aside leaves the
+# service writing into the archive. So this script copies, then truncates:
+# it compresses a copy to NAME.0.bz2, verifies the archive, and only then
+# truncates the live file. launchd opens StandardErrorPath in append mode, so
+# the service's next write lands at the new end of the file. This was checked
+# on 2026-11-21 against the log of an MCP Agent Mail server run by launchd.
+#
+# Lines written between the copy and the truncation are lost. Each run takes
+# well under a second, so the window is small, and the alternative, restarting
+# the service, would interrupt cross-session messaging.
+#
+# Configuration is a list of logs, one "path size_kb keep" per line: the path,
+# the size in KB above which to rotate, and the archives to keep. Archives are
+# NAME.0.bz2 (newest) to NAME.<n-1>.bz2. The list is taken from ROTATE_LOGS
+# when it is set, else from ROTATE_LOGS_CONF (~/.config/rotate-logs.conf) when
+# that file exists, else from the default below, which names the logs of an
+# MCP Agent Mail server. A listed log that does not exist is skipped, so the
+# default does nothing on a machine without one. In the file, blank lines and
+# lines starting with # are ignored, and $HOME is not expanded, so give full
+# paths.
+#
+# This script also deletes old MCP Agent Mail database backups, as documented
+# at prune_reclaimable and prune_backups below. Both do nothing when their
+# folder does not exist. Set ROTATE_PRUNE=0 to turn the pruning off.
+#
+# Exit status: 0 on success, 1 when any rotation failed, which is reported on
+# standard error and leaves that log untouched.
+
+set -u
+
+CONF=${ROTATE_LOGS_CONF:-${HOME}/.config/rotate-logs.conf}
+if [ -n "${ROTATE_LOGS:-}" ]; then
+    LOGS=$ROTATE_LOGS
+elif [ -r "$CONF" ]; then
+    LOGS=$(grep -v -E '^[[:space:]]*(#|$)' "$CONF")
+else
+    LOGS="
+${HOME}/Library/Logs/mcp-agent-mail.err 5120 4
+${HOME}/Library/Logs/mcp-agent-mail.log 5120 4
+"
+fi
+
+status=0
+
+say() {
+    printf '%s rotate-logs: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+}
+
+is_count() {
+    case $1 in ''|*[!0-9]*) return 1 ;; *) [ "$1" -gt 0 ] ;; esac
+}
+
+rotate() {
+    log=$1 limit_kb=$2 keep=$3
+    if ! is_count "$limit_kb" || ! is_count "$keep"; then
+        say "invalid entry for ${log}: size and keep must be positive integers" >&2
+        status=1
+        return
+    fi
+    [ -f "$log" ] || return 0
+    size_kb=$(( $(stat -f %z "$log") / 1024 ))
+    [ "$size_kb" -gt "$limit_kb" ] || return 0
+    # Shift the older archives up by one, dropping the oldest.
+    i=$((keep - 1))
+    rm -f "${log}.${i}.bz2"
+    while [ "$i" -gt 0 ]; do
+        j=$((i - 1))
+        [ -f "${log}.${j}.bz2" ] && mv "${log}.${j}.bz2" "${log}.${i}.bz2"
+        i=$j
+    done
+    tmp=${log}.0.bz2.tmp
+    if ! bzip2 -c "$log" > "$tmp" || ! bzip2 -t "$tmp"; then
+        rm -f "$tmp"
+        say "could not archive ${log}; left untouched" >&2
+        status=1
+        return
+    fi
+    mv "$tmp" "${log}.0.bz2"
+    : > "$log"
+    say "rotated ${log} at ${size_kb} KB"
+}
+
+# Agent Mail keeps an hourly database backup beside its database and moves all
+# but the newest three into doctor/reclaimable/rotation-<time>/ on each cold
+# start. Nothing else removes them, and 446 had piled up on one machine within
+# a month. Rotations older than RECLAIM_DAYS are deleted. The project's recovery runbook says to
+# copy backups elsewhere before restarting after a corruption report, so a
+# rotation is kept for two weeks, long enough to notice such a report.
+RECLAIM_DIR=${ROTATE_RECLAIM_DIR:-${HOME}/.local/share/mcp-agent-mail/git_mailbox_repo/doctor/reclaimable}
+RECLAIM_DAYS=${ROTATE_RECLAIM_DAYS:-14}
+
+prune_reclaimable() {
+    [ -d "$RECLAIM_DIR" ] || return 0
+    find "$RECLAIM_DIR" -mindepth 1 -maxdepth 1 -type d -name 'rotation-*' -mtime +"$RECLAIM_DAYS" |
+    while IFS= read -r old; do
+        rm -rf -- "$old" && say "removed Agent Mail backup rotation ${old##*/}"
+    done
+}
+
+# Between cold starts the server also leaves its hourly database backups,
+# storage.sqlite3.bak.<YYYYMMDD_HHMMSS>, beside the database, about 470 KB
+# each, and 218 built up over nine days on one machine. A backup is deleted
+# when it is older than BAK_DAYS and is not among the newest BAK_KEEP, so a day of hourly
+# backups always remains, including the one being written. Only that exact
+# timestamped name is ever matched: the database itself, the untimestamped
+# storage.sqlite3.bak and the server's state files are never touched.
+BAK_DIR=${ROTATE_BAK_DIR:-${HOME}/.local/share/mcp-agent-mail/git_mailbox_repo}
+BAK_KEEP=${ROTATE_BAK_KEEP:-24}
+BAK_DAYS=${ROTATE_BAK_DAYS:-3}
+
+prune_backups() {
+    [ -d "$BAK_DIR" ] || return 0
+    # Newest first, by the timestamp in the name, which sorts as text. The glob
+    # lists candidates and grep then keeps only the exact timestamped form.
+    for path in "$BAK_DIR"/storage.sqlite3.bak.*; do
+        [ -f "$path" ] && printf '%s\n' "${path##*/}"
+    done | grep -E '^storage\.sqlite3\.bak\.[0-9]{8}_[0-9]{6}$' | sort -r |
+        tail -n +"$((BAK_KEEP + 1))" |
+    while IFS= read -r name; do
+        old=$(find "${BAK_DIR}/${name}" -prune -type f -mtime +"$BAK_DAYS" 2>/dev/null)
+        [ -n "$old" ] || continue
+        rm -f -- "$old" && say "removed Agent Mail database backup ${name}"
+    done
+}
+
+# A here-document, not a pipeline, so that the loop runs in this shell and a
+# failure recorded in status survives it.
+while read -r path limit keep; do
+    [ -n "$path" ] || continue
+    rotate "$path" "$limit" "$keep"
+done <<EOF
+$LOGS
+EOF
+# The retention settings reach find and shell arithmetic, so a value that is
+# not a whole number stops the pruning rather than being guessed at.
+if [ "${ROTATE_PRUNE:-1}" != 0 ]; then
+    case "${RECLAIM_DAYS}${BAK_KEEP}${BAK_DAYS}" in
+        *[!0-9]*)
+            say "ROTATE_RECLAIM_DAYS, ROTATE_BAK_KEEP and ROTATE_BAK_DAYS must be whole numbers; nothing pruned" >&2
+            status=1 ;;
+        *)
+            prune_reclaimable
+            prune_backups ;;
+    esac
+fi
+exit "$status"

@@ -1,0 +1,108 @@
+#!/bin/sh
+# Report the size of build output, caches and harness data, and how much each
+# grew since the previous run.
+#
+# The low-disk event of 2026-10-30 came from build output, so growth here is
+# the early warning that comes before Health Alert's free-space alert. The
+# report only measures. Cleaning belongs to the session that owns each folder.
+#
+# Weekly rather than daily. As a daily job it took 950 seconds of disk scanning
+# on an overloaded machine, mostly in a 78 GB node_modules and the Simulator
+# data. du now runs at background priority through taskpolicy -b. The daily
+# 200.disk-trend job, which reads df and costs nothing, gives the daily early
+# warning, and this job says which folder grew. Growth is now per week.
+
+# Settings, from ~/.config/periodic.conf when it exists:
+#   PERIODIC_PROJECTS         the folder searched for build output (~/projects)
+#   PERIODIC_GROWTH_PATH_GB   one folder's weekly growth that is a finding (10)
+#   PERIODIC_GROWTH_TOTAL_GB  the total weekly growth that is a finding (20)
+#   PERIODIC_SIZE_WARN_GB     one folder's size that is a finding (50)
+#   PERIODIC_GROWTH_EXTRA     further folders to measure, separated by spaces
+
+set -u
+
+root=${PERIODIC_PROJECTS:-${HOME}/projects}
+path_growth_gb=${PERIODIC_GROWTH_PATH_GB:-10}
+total_growth_gb=${PERIODIC_GROWTH_TOTAL_GB:-20}
+size_warn_gb=${PERIODIC_SIZE_WARN_GB:-50}
+state_dir=${PERIODIC_STATE_DIR:-${HOME}/Library/Caches/local.periodic}
+prev=${state_dir}/sizes.prev
+now=${state_dir}/sizes.now
+
+mkdir -p "$state_dir"
+: > "$now"
+
+measure() {
+    [ -d "$1" ] || return 0
+    kb=$(/usr/sbin/taskpolicy -b du -sk "$1" 2>/dev/null | awk '{ print $1 }')
+    [ -n "$kb" ] && printf '%s\t%s\n' "$kb" "$1" >> "$now"
+}
+
+# Build output inside projects. -prune stops find at the first match, so a
+# folder is never counted inside another one.
+find "$root" -maxdepth 6 -type d \( -name target -o -name node_modules -o -name tmp \
+    -o -name build -o -name DerivedData -o -name .gradle \) -prune -print 2>/dev/null |
+while IFS= read -r dir; do
+    measure "$dir"
+done
+
+for dir in \
+    "${HOME}/Library/Caches/Mozilla.sccache" \
+    "${HOME}/Library/Developer/CoreSimulator" \
+    "${HOME}/Library/Developer/CoreDevice" \
+    "${HOME}/.codex/sessions" \
+    "${HOME}/.claude/projects" \
+    "${HOME}/.ollama" \
+    "${HOME}/Downloads"; do
+    measure "$dir"
+done
+# Split on spaces on purpose: one argument per extra folder.
+# shellcheck disable=SC2086
+for dir in ${PERIODIC_GROWTH_EXTRA:-}; do
+    measure "$dir"
+done
+
+gb() {
+    awk -v kb="$1" 'BEGIN { printf "%.1f", kb / 1048576 }'
+}
+
+total=$(awk -F'\t' '{ s += $1 } END { print s + 0 }' "$now")
+echo "Measured $(wc -l < "$now" | tr -d ' ') folders, $(gb "$total") GB in total."
+echo
+echo "Largest folders:"
+sort -rn "$now" | head -15 | while IFS="$(printf '\t')" read -r kb dir; do
+    printf '  %8s GB  %s\n' "$(gb "$kb")" "${dir#"${HOME}"/}"
+done
+
+sort -rn "$now" | while IFS="$(printf '\t')" read -r kb dir; do
+    [ "$kb" -ge $((size_warn_gb * 1048576)) ] &&
+        echo "ATTENTION: ~/${dir#"${HOME}"/} holds $(gb "$kb") GB, over ${size_warn_gb} GB"
+done
+
+if [ -r "$prev" ]; then
+    echo
+    echo "Growth since the previous run:"
+    # Join on the path. A folder missing from the previous run counts from 0.
+    awk -F'\t' -v path_kb=$((path_growth_gb * 1048576)) -v home="$HOME/" '
+        NR == FNR { before[$2] = $1; next }
+        {
+            delta = $1 - before[$2]
+            if (delta > 1048576 || delta < -1048576) {
+                name = $2; sub(home, "~/", name)
+                printf "  %+8.1f GB  %s\n", delta / 1048576, name
+                if (delta >= path_kb)
+                    printf "ATTENTION: %s grew %.1f GB since the previous run\n", name, delta / 1048576
+            }
+        }' "$prev" "$now"
+    before_total=$(awk -F'\t' '{ s += $1 } END { print s + 0 }' "$prev")
+    delta=$((total - before_total))
+    echo "  Total change: $(gb "$delta") GB"
+    [ "$delta" -ge $((total_growth_gb * 1048576)) ] &&
+        echo "ATTENTION: build output grew $(gb "$delta") GB in total since the previous run"
+else
+    echo
+    echo "No previous run to compare with; growth is reported from the next run."
+fi
+
+mv "$now" "$prev"
+exit 0

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered from a template by scripts/install.sh, which fills in the home folder. -->
+<!--
+  Hourly memory, swap, and disk headroom check. See ~/.local/bin/memwatch.
+  The script runs directly, not through /bin/bash, so that System Settings
+  lists this background item as "memwatch".
+  Summary log: ~/Library/Logs/memwatch.log
+  Disable: launchctl bootout gui/$(id -u)/local.memwatch
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>Label</key>
+	<string>local.memwatch</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@HOME@/.local/bin/memwatch</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/memwatch.err</string>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+</dict>
+</plist>

@@ -1,0 +1,53 @@
+#!/bin/sh
+# Report work that exists only on this disk: uncommitted changes, commits on
+# no remote, stashes, and repositories with no remote at all.
+#
+# On a machine without backups, this is the list of what would be lost with
+# it. The scan is read only. GIT_OPTIONAL_LOCKS=0 stops git status
+# from refreshing the index, so it never takes a lock that a working session
+# could trip over.
+
+# Settings, from ~/.config/periodic.conf when it exists:
+#   PERIODIC_PROJECTS  the folder searched for repositories, five levels deep
+#                      (~/projects)
+
+set -u
+
+root=${PERIODIC_PROJECTS:-${HOME}/projects}
+export GIT_OPTIONAL_LOCKS=0
+
+checked=0
+flagged=0
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
+
+# A .git directory is a repository; a .git file is a worktree or submodule.
+find "$root" -maxdepth 5 \( -name node_modules -o -name target -o -name .build \
+    -o -name vendor -o -name Pods \) -prune -o -name .git -print 2>/dev/null | sort > "$list"
+
+while IFS= read -r git_path; do
+    repo=$(dirname "$git_path")
+    checked=$((checked + 1))
+    short=${repo#"${HOME}"/}
+    changes=$(git -C "$repo" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    notes=
+    [ "$changes" -gt 0 ] && notes="${notes}, ${changes} uncommitted"
+    if [ -d "$git_path" ]; then
+        # Branches, stashes and remotes are shared by all worktrees, so they are
+        # counted once, at the main repository.
+        if [ -z "$(git -C "$repo" remote 2>/dev/null)" ]; then
+            notes="${notes}, no remote"
+        else
+            local_only=$(git -C "$repo" rev-list --count --branches --not --remotes 2>/dev/null || echo 0)
+            [ "$local_only" -gt 0 ] && notes="${notes}, ${local_only} commits on no remote"
+        fi
+        stashes=$(git -C "$repo" stash list 2>/dev/null | wc -l | tr -d ' ')
+        [ "$stashes" -gt 0 ] && notes="${notes}, ${stashes} stashes"
+    fi
+    if [ -n "$notes" ]; then
+        flagged=$((flagged + 1))
+        echo "ATTENTION: ~/${short}${notes}"
+    fi
+done < "$list"
+
+echo "${checked} repositories and worktrees checked, ${flagged} hold work that exists only on this disk."

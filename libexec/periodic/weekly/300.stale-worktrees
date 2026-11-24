@@ -1,0 +1,76 @@
+#!/bin/sh
+# Report git worktrees that look finished or abandoned: their branch is merged
+# into the default branch and idle for PERIODIC_MERGED_DAYS, they have had no
+# commit for PERIODIC_STALE_DAYS, or their folder is gone. A branch just made
+# from the default branch counts as merged until it gets a commit of its own,
+# which is why a merged branch must also be idle before it is flagged. Each is listed with the size of its build output.
+#
+# Removing a worktree is left to the session that owns it, since a worktree
+# can hold uncommitted work that this report does not judge.
+
+set -u
+
+root=${PERIODIC_PROJECTS:-${HOME}/projects}
+stale_days=${PERIODIC_STALE_DAYS:-14}
+merged_days=${PERIODIC_MERGED_DAYS:-2}
+export GIT_OPTIONAL_LOCKS=0
+now=$(date +%s)
+listed=0
+flagged=0
+repos=$(mktemp)
+trees=$(mktemp)
+trap 'rm -f "$repos" "$trees"' EXIT
+
+# Main repositories only: a .git directory, not a .git file.
+find "$root" -maxdepth 5 \( -name node_modules -o -name target -o -name .build \
+    -o -name vendor -o -name Pods \) -prune -o -type d -name .git -print 2>/dev/null | sort > "$repos"
+
+while IFS= read -r git_dir; do
+    repo=$(dirname "$git_dir")
+    default=$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+    if [ -z "$default" ]; then
+        for candidate in main master; do
+            if git -C "$repo" rev-parse --verify --quiet "$candidate" >/dev/null; then
+                default=$candidate
+                break
+            fi
+        done
+    fi
+    # Porcelain output is a block per worktree: "worktree PATH", then "branch
+    # REF" or "detached", and "prunable REASON" when its folder is missing.
+    git -C "$repo" worktree list --porcelain 2>/dev/null |
+        awk '/^worktree / { if (p != "") print p "\t" b "\t" x; p = substr($0, 10); b = "-"; x = "" }
+             /^branch /   { b = substr($0, 8) }
+             /^prunable/  { x = "prunable" }
+             END          { if (p != "") print p "\t" b "\t" x }' | tail -n +2 > "$trees"
+    while IFS="$(printf '\t')" read -r tree branch prunable; do
+        listed=$((listed + 1))
+        short=${tree#"${HOME}"/}
+        if [ "$prunable" = prunable ]; then
+            flagged=$((flagged + 1))
+            echo "ATTENTION: ~/${short}: folder is missing; git worktree prune would clear it"
+            continue
+        fi
+        last=$(git -C "$tree" log -1 --format=%ct 2>/dev/null || echo "$now")
+        idle=$(( (now - last) / 86400 ))
+        merged=no
+        if [ -n "$default" ] && [ "$branch" != - ] &&
+            git -C "$repo" merge-base --is-ancestor "$branch" "$default" 2>/dev/null; then
+            merged=yes
+        fi
+        size=-
+        [ -d "${tree}/target" ] && size=$(du -sk "${tree}/target" 2>/dev/null |
+            awk '{ printf "%.1f GB", $1 / 1048576 }')
+        # shellcheck disable=SC2088 # a literal ~ for display
+        line="~/${short}: ${branch#refs/heads/}, ${idle} days idle, merged into ${default:-?}: ${merged}, target ${size}"
+        if { [ "$merged" = yes ] && [ "$idle" -ge "$merged_days" ]; } ||
+            [ "$idle" -ge "$stale_days" ]; then
+            flagged=$((flagged + 1))
+            echo "ATTENTION: ${line}"
+        else
+            echo "  ${line}"
+        fi
+    done < "$trees"
+done < "$repos"
+
+echo "${listed} worktrees listed, ${flagged} look merged and idle, idle for ${stale_days} days or more, or missing."

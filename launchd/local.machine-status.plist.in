@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered from a template by scripts/install.sh, which fills in the home folder. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.machine-status</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>@HOME@/.local/bin/machine-status</string>
+		<string>sample</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/machine-status.log</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/Library/Logs/machine-status.log</string>
+</dict>
+</plist>

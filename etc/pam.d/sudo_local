@@ -1,0 +1,7 @@
+# sudo_local: local additions to sudo's PAM stack, kept across macOS updates.
+# Lets an administrator approve sudo with Touch ID instead of a password.
+# Installed by the touchid section of scripts/install.sh, which runs:
+#   sudo install -m 444 -o root -g wheel etc/pam.d/sudo_local /etc/pam.d/sudo_local
+# Touch ID does not work over SSH or inside tmux and screen, where sudo falls
+# back to the password.
+auth       sufficient     pam_tid.so

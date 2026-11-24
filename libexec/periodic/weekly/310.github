@@ -1,0 +1,75 @@
+#!/bin/sh
+# Report GitHub hygiene for every non-archived repository an owner has made:
+# open Dependabot alerts, open pull requests, a failing latest run on the
+# default branch, and runs queued or in progress for more than a day.
+#
+# It was written after a workflow run was found to have sat queued for seven
+# weeks, and another repository to hold twelve unread OpenSSL alerts, with
+# nothing reporting either. It needs the network and the GitHub command-line
+# tool's stored login, and makes about four API calls a repository.
+#
+# Settings, from ~/.config/periodic.conf when it exists:
+#   PERIODIC_GITHUB_OWNER  the user or organization whose repositories are
+#                          checked (the user gh is logged in as)
+
+set -u
+
+owner=${PERIODIC_GITHUB_OWNER:-}
+if [ -z "$owner" ]; then
+    owner=$(gh api user -q .login 2>/dev/null) || {
+        echo "ATTENTION: gh could not reach GitHub or is not logged in"
+        exit 0
+    }
+fi
+
+repos=$(gh repo list "$owner" --source --no-archived --limit 400 \
+    --json nameWithOwner,defaultBranchRef -q '.[] | "\(.nameWithOwner) \(.defaultBranchRef.name // "-")"' 2>/dev/null) || {
+    echo "ATTENTION: could not list the repositories of ${owner}"
+    exit 0
+}
+
+count=0
+flagged=0
+alerts_off=
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
+printf '%s\n' "$repos" > "$list"
+
+while read -r repo branch; do
+    [ -n "$repo" ] || continue
+    count=$((count + 1))
+    notes=
+    # Alerts answer 403 when Dependabot alerts are off, which is reported too.
+    alerts=$(gh api "repos/${repo}/dependabot/alerts?state=open&per_page=100" -q 'length' 2>/dev/null) || alerts=off
+    # One page holds at most 100 alerts, so 100 means 100 or more.
+    case $alerts in
+        off) alerts_off="${alerts_off} ${repo#*/}" ;;
+        0) ;;
+        100) notes="${notes}, 100 or more open Dependabot alerts" ;;
+        *) notes="${notes}, ${alerts} open Dependabot alerts" ;;
+    esac
+    prs=$(gh pr list -R "$repo" --state open --json number -q 'length' 2>/dev/null || echo 0)
+    [ "$prs" -gt 0 ] && notes="${notes}, ${prs} open pull requests"
+    if [ "$branch" != - ]; then
+        latest=$(gh run list -R "$repo" -b "$branch" -L 1 --json conclusion,status,workflowName \
+            -q '.[0] | "\(.status) \(.conclusion // "-") \(.workflowName)"' 2>/dev/null)
+        case $latest in
+            "completed failure "*|"completed timed_out "*|"completed startup_failure "*)
+                notes="${notes}, latest run on ${branch} failed (${latest#completed })" ;;
+        esac
+    fi
+    stuck=$(gh run list -R "$repo" -L 100 --json status,createdAt \
+        -q '[.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting")
+             | select((now - (.createdAt | fromdateiso8601)) > 86400)] | length' 2>/dev/null || echo 0)
+    [ "$stuck" -gt 0 ] && notes="${notes}, ${stuck} runs unfinished after a day"
+    if [ -n "$notes" ]; then
+        flagged=$((flagged + 1))
+        echo "ATTENTION: ${repo}${notes#,}"
+    fi
+done < "$list"
+
+if [ -n "$alerts_off" ]; then
+    flagged=$((flagged + 1))
+    echo "ATTENTION: Dependabot alerts are off in $(echo "$alerts_off" | wc -w | tr -d ' ') repositories:${alerts_off}"
+fi
+echo "${count} repositories of ${owner} checked, ${flagged} findings."

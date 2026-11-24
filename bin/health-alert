@@ -1,0 +1,306 @@
+#!/bin/sh
+# Warn when this Mac's health needs attention.
+#
+# Run every few minutes by ~/Library/LaunchAgents/local.health-alert.plist,
+# through the Health Alert applet, which calls it with --print and shows each
+# alert itself, so that macOS names the alert after the applet and not after
+# sh. Without --print it shows the alerts through osascript.
+#
+# Checks, each with its own warning and critical level:
+#   disk    free space on the data volume, because macOS purges caches and
+#           swap cannot grow once the disk is nearly full
+#   memory  the kernel's memory pressure level, and swap in use
+#   smart   the SSD's SMART health, spare capacity, media errors and wear,
+#           read with smartctl from smartmontools. HEALTH_SMARTCTL names the
+#           program; by default the MacPorts and Homebrew locations are
+#           tried. Set HEALTH_SMARTCTL=off to skip the check on a machine
+#           without smartmontools, rather than logging an error every run.
+#   uptime  a reminder to plan a restart, never critical
+#   sampler the machine-status sampler, a warning when its status file is
+#           older than SAMPLER_STALE_SECONDS, because agent sessions read it
+#   memwatch the hourly memwatch job, a warning when its log is older than
+#           MEMWATCH_STALE_SECONDS. memwatch in turn warns when this script's
+#           memory log goes stale, so each watches the other.
+#   queue   findings from the periodic reports, shown once each as warnings
+#
+# Every run also appends one memory sample to MEMORY_LOG, whatever the alert
+# level, so that the history shows how fast memory fills after a restart:
+#
+#   2026-10-30T20:50:00-0700 pressure=1 swap_used_mb=2497 swap_total_mb=4096
+#       compressed_mb=7475 free_mb=612 load1=4.72
+#
+# on one line. Pressure is 1, 2 or 4, as below. Free memory is free plus
+# speculative pages, which is the memory nothing holds. A field that could not
+# be read is written as -. Set HEALTH_MEMORY_LOG=/dev/null to stop sampling.
+#
+# A check alerts at once when its level changes, and resets when it recovers.
+# A sustained level repeats after REPEAT_SECONDS, then after twice that, and so
+# on, doubling up to REPEAT_MAX_SECONDS. The backoff was added on 2026-11-18,
+# after disk and swap had sat at critical since 2026-11-07 and an hourly repeat
+# carried no new information. The state file holds the level, the time of the
+# last alert and the current interval. A state file in the older two-field form
+# is read with the interval taken as REPEAT_SECONDS.
+#
+# With --print, each due alert is printed to standard output as
+# LEVEL|TITLE|MESSAGE, one per line.
+# Exit status: 0 when every check ran, 1 when a reading failed, which is
+# logged, and 2 on a usage error.
+
+set -u
+
+DISK_VOLUME=${HEALTH_DISK_VOLUME:-/System/Volumes/Data}
+DISK_WARN_GB=${HEALTH_DISK_WARN_GB:-100}
+DISK_CRIT_GB=${HEALTH_DISK_CRIT_GB:-50}
+SWAP_WARN_GB=${HEALTH_SWAP_WARN_GB:-5}
+SWAP_CRIT_GB=${HEALTH_SWAP_CRIT_GB:-8}
+SMART_DEVICE=${HEALTH_SMART_DEVICE:-disk0}
+SMART_WEAR_WARN=${HEALTH_SMART_WEAR_WARN:-80}
+UPTIME_WARN_DAYS=${HEALTH_UPTIME_WARN_DAYS:-14}
+REPEAT_SECONDS=${HEALTH_REPEAT_SECONDS:-3600}
+REPEAT_MAX_SECONDS=${HEALTH_REPEAT_MAX_SECONDS:-86400}
+SAMPLER_STATUS=${HEALTH_SAMPLER_STATUS:-${HOME}/.local/state/machine-status/status}
+SAMPLER_STALE_SECONDS=${HEALTH_SAMPLER_STALE_SECONDS:-600}
+MEMWATCH_LOG=${HEALTH_MEMWATCH_LOG:-${HOME}/Library/Logs/memwatch.log}
+MEMWATCH_STALE_SECONDS=${HEALTH_MEMWATCH_STALE_SECONDS:-11400}
+STATE_DIR=${HEALTH_STATE_DIR:-${HOME}/Library/Caches/local.health-alert}
+LOG_FILE=${HEALTH_LOG:-${HOME}/Library/Logs/health-alert.log}
+MEMORY_LOG=${HEALTH_MEMORY_LOG:-${HOME}/Library/Logs/health-alert-memory.log}
+SMARTCTL=${HEALTH_SMARTCTL:-}
+# launchd starts this with a minimal PATH, so the usual install locations are
+# tried explicitly. An empty result is reported by check_smart.
+if [ -z "$SMARTCTL" ]; then
+    for candidate in /opt/local/sbin/smartctl /opt/homebrew/sbin/smartctl \
+        /usr/local/sbin/smartctl "$(command -v smartctl 2>/dev/null)"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            SMARTCTL=$candidate
+            break
+        fi
+    done
+fi
+
+usage() {
+    echo "usage: health-alert [--print]" >&2
+    exit 2
+}
+
+print_only=false
+case $# in
+    0) ;;
+    1) [ "$1" = --print ] || usage
+       print_only=true ;;
+    *) usage ;;
+esac
+
+status=0
+
+log() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG_FILE"
+}
+
+is_number() {
+    case $1 in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+# report CHECK LEVEL TITLE MESSAGE
+# LEVEL is ok, warning or critical. Decides whether the alert is due, records
+# the state, logs it, and shows or prints it.
+report() {
+    check=$1 level=$2 title=$3 message=$4
+    state_file=${STATE_DIR}/${check}
+    if [ "$level" = ok ]; then
+        rm -f "$state_file"
+        return 0
+    fi
+    now=$(date +%s)
+    last_level=
+    last_time=0
+    last_interval=$REPEAT_SECONDS
+    if [ -r "$state_file" ]; then
+        read -r last_level last_time last_interval < "$state_file" || true
+        is_number "$last_time" || last_time=0
+        is_number "$last_interval" || last_interval=$REPEAT_SECONDS
+        [ "$last_interval" -gt 0 ] || last_interval=$REPEAT_SECONDS
+    fi
+    interval=$REPEAT_SECONDS
+    if [ "$level" = "$last_level" ]; then
+        # The same level again: quiet until the interval passes, then double it.
+        [ $((now - last_time)) -lt "$last_interval" ] && return 0
+        interval=$((last_interval * 2))
+        [ "$interval" -gt "$REPEAT_MAX_SECONDS" ] && interval=$REPEAT_MAX_SECONDS
+    elif [ "$last_level" = critical ] && [ $((now - last_time)) -lt "$last_interval" ]; then
+        # A critical alert is not followed by a warning within its interval.
+        return 0
+    fi
+    mkdir -p "$STATE_DIR"
+    printf '%s %s %s\n' "$level" "$now" "$interval" > "$state_file"
+    log "$check $level: $message"
+    if [ "$print_only" = true ]; then
+        printf '%s|%s|%s\n' "$level" "$title" "$message"
+    elif [ "$level" = critical ]; then
+        osascript -e "display alert \"$title\" message \"$message\" as critical" >/dev/null 2>&1 &
+    else
+        osascript -e "display notification \"$message\" with title \"$title\" sound name \"Basso\"" >/dev/null 2>&1
+    fi
+}
+
+check_disk() {
+    # df -P -k prints POSIX output in 1024-byte blocks; field 4 is available.
+    free_kb=$(df -P -k "$DISK_VOLUME" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    if ! is_number "$free_kb"; then
+        log "disk error: could not read free space on $DISK_VOLUME"
+        status=1
+        return
+    fi
+    free_gb=$((free_kb / 1024 / 1024))
+    level=ok
+    [ "$free_gb" -lt "$DISK_WARN_GB" ] && level=warning
+    [ "$free_gb" -lt "$DISK_CRIT_GB" ] && level=critical
+    report disk "$level" "Low disk space" "${free_gb} GB free on ${DISK_VOLUME}."
+}
+
+# sample_memory PRESSURE SWAP_USED_MB
+# Appends one line to MEMORY_LOG. A sample that cannot be written is logged
+# but does not fail the run, since the alert itself has already been decided.
+sample_memory() {
+    swap_total_mb=$(sysctl -n vm.swapusage 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "total") { v = $(i + 2); sub(/M$/, "", v); printf "%d", v } }')
+    is_number "$swap_total_mb" || swap_total_mb=-
+    # vm_stat counts pages; its first line names the page size in bytes.
+    pages=$(vm_stat 2>/dev/null | awk '
+        /page size of/ { for (i = 1; i <= NF; i++) if ($i == "of") size = $(i + 1) }
+        /^Pages free:/ { free += $3 }
+        /^Pages speculative:/ { free += $3 }
+        /^Pages occupied by compressor:/ { comp = $5 }
+        END { if (size > 0) printf "%d %d", comp * size / 1048576, free * size / 1048576 }')
+    compressed_mb=${pages% *}
+    free_mb=${pages#* }
+    is_number "$compressed_mb" || compressed_mb=-
+    is_number "$free_mb" || free_mb=-
+    # vm.loadavg reads like "{ 4.72 5.61 8.67 }".
+    load1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{ print $2 }')
+    [ -n "$load1" ] || load1=-
+    if ! { mkdir -p "$(dirname "$MEMORY_LOG")" &&
+        printf '%s pressure=%s swap_used_mb=%s swap_total_mb=%s compressed_mb=%s free_mb=%s load1=%s\n' \
+            "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" "$2" "$swap_total_mb" \
+            "$compressed_mb" "$free_mb" "$load1" >> "$MEMORY_LOG"; } 2>/dev/null; then
+        log "memory error: could not write a sample to $MEMORY_LOG"
+    fi
+}
+
+check_memory() {
+    # 1 is normal, 2 warning and 4 critical, as macOS's memory_pressure reports.
+    pressure=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+    # vm.swapusage reads like "total = 5120.00M  used = 4004.62M  free = ...".
+    swap_mb=$(sysctl -n vm.swapusage 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "used") { v = $(i + 2); sub(/M$/, "", v); printf "%d", v } }')
+    if ! is_number "$pressure" || ! is_number "$swap_mb"; then
+        log "memory error: could not read memory pressure or swap"
+        status=1
+        return
+    fi
+    sample_memory "$pressure" "$swap_mb"
+    swap_gb=$((swap_mb / 1024))
+    level=ok
+    if [ "$pressure" -ge 2 ] || [ "$swap_gb" -ge "$SWAP_WARN_GB" ]; then
+        level=warning
+    fi
+    if [ "$pressure" -ge 4 ] || [ "$swap_gb" -ge "$SWAP_CRIT_GB" ]; then
+        level=critical
+    fi
+    case $pressure in 1) word=normal ;; 2) word=warning ;; 4) word=critical ;; *) word="level $pressure" ;; esac
+    report memory "$level" "Memory pressure" \
+        "Memory pressure is ${word} and ${swap_gb} GB of swap is in use. Close idle sessions or plan a restart."
+}
+
+check_smart() {
+    [ "$SMARTCTL" = off ] && return 0
+    if [ -z "$SMARTCTL" ] || [ ! -x "$SMARTCTL" ]; then
+        log "smart error: smartctl not found; install smartmontools or set HEALTH_SMARTCTL=off"
+        status=1
+        return
+    fi
+    out=$("$SMARTCTL" -H -A "$SMART_DEVICE" 2>/dev/null)
+    health=$(printf '%s\n' "$out" | awk -F': *' '/overall-health/ { print $2 }')
+    warning=$(printf '%s\n' "$out" | awk -F': *' '/^Critical Warning/ { print $2 }')
+    spare=$(printf '%s\n' "$out" | awk -F': *' '/^Available Spare:/ { sub(/%/, "", $2); print $2 }')
+    spare_min=$(printf '%s\n' "$out" | awk -F': *' '/^Available Spare Threshold/ { sub(/%/, "", $2); print $2 }')
+    used=$(printf '%s\n' "$out" | awk -F': *' '/^Percentage Used/ { sub(/%/, "", $2); print $2 }')
+    errors=$(printf '%s\n' "$out" | awk -F': *' '/^Media and Data Integrity Errors/ { gsub(/,/, "", $2); print $2 }')
+    if [ -z "$health" ] || ! is_number "$spare" || ! is_number "$spare_min" ||
+        ! is_number "$used" || ! is_number "$errors"; then
+        log "smart error: could not read SMART data for $SMART_DEVICE"
+        status=1
+        return
+    fi
+    level=ok
+    [ "$used" -ge "$SMART_WEAR_WARN" ] && level=warning
+    if [ "$health" != PASSED ] || [ "$warning" != 0x00 ] || [ "$errors" -gt 0 ] ||
+        [ "$spare" -lt "$spare_min" ]; then
+        level=critical
+    fi
+    report smart "$level" "SSD health" \
+        "SMART ${health}, critical warning ${warning}, ${errors} media errors, spare ${spare}% against ${spare_min}%, ${used}% worn."
+}
+
+check_uptime() {
+    # kern.boottime reads like "{ sec = 1792312808, usec = 0 } ...".
+    boot=$(sysctl -n kern.boottime 2>/dev/null | awk '{ v = $4; sub(/,$/, "", v); print v }')
+    if ! is_number "$boot"; then
+        log "uptime error: could not read the boot time"
+        status=1
+        return
+    fi
+    days=$((($(date +%s) - boot) / 86400))
+    level=ok
+    [ "$days" -ge "$UPTIME_WARN_DAYS" ] && level=warning
+    report uptime "$level" "Restart due" "Up ${days} days. Plan a restart."
+}
+
+# check_stale CHECK FILE MAX_SECONDS TITLE WHAT
+# Warns when FILE is missing or was last modified more than MAX_SECONDS ago.
+check_stale() {
+    check=$1 file=$2 max=$3 title=$4 what=$5
+    if [ ! -e "$file" ]; then
+        report "$check" warning "$title" "${what} has no output at ${file}."
+        return
+    fi
+    mtime=$(stat -f %m "$file" 2>/dev/null)
+    if ! is_number "$mtime"; then
+        log "${check} error: could not read the age of ${file}"
+        status=1
+        return
+    fi
+    age=$(($(date +%s) - mtime))
+    level=ok
+    [ "$age" -gt "$max" ] && level=warning
+    report "$check" "$level" "$title" "${what} last wrote $((age / 60)) minutes ago. Check its LaunchAgent."
+}
+
+check_queue() {
+    # periodic-run appends TITLE|MESSAGE lines here when a report has findings.
+    # Each is shown once, as a warning, and the queue is emptied.
+    queue=${STATE_DIR}/queue
+    [ -s "$queue" ] || return 0
+    taken=${queue}.$$
+    mv "$queue" "$taken" || return 0
+    while IFS='|' read -r title message; do
+        [ -n "$title" ] || continue
+        log "queue warning: ${title}: ${message}"
+        if [ "$print_only" = true ]; then
+            printf 'warning|%s|%s\n' "$title" "$message"
+        else
+            osascript -e "display notification \"$message\" with title \"$title\" sound name \"Basso\"" >/dev/null 2>&1
+        fi
+    done < "$taken"
+    rm -f "$taken"
+}
+
+check_disk
+check_memory
+check_smart
+check_uptime
+check_stale sampler "$SAMPLER_STATUS" "$SAMPLER_STALE_SECONDS" "Machine status stale" "The machine-status sampler"
+check_stale memwatch "$MEMWATCH_LOG" "$MEMWATCH_STALE_SECONDS" "memwatch stale" "The hourly memwatch job"
+check_queue
+exit "$status"

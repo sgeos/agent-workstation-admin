@@ -1,0 +1,35 @@
+# Harden macOS's sshd for the case where Remote Login is turned back on.
+#
+# sshd keeps the first value it reads for each keyword, and reads the files in
+# sshd_config.d in name order, so this file's 050 prefix places it before
+# Apple's 100-macos.conf and before the main sshd_config.
+# A template. The sshd section of scripts/install.sh fills in the USER
+# placeholder with the target account, installs the result and checks it, as
+# in:
+#   sudo install -m 644 -o root -g wheel 050-hardening.conf /etc/ssh/sshd_config.d/
+#   sudo sshd -t
+#
+# Keys only: no passwords, no keyboard-interactive prompts, no root, and only
+# the installing account. Add a key to ~/.ssh/authorized_keys before relying on it.
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AllowUsers @USER@
+
+# Limit guessing and idle connections.
+MaxAuthTries 3
+MaxSessions 4
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# No forwarding unless a later need is written down here.
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+PermitTunnel no
+GatewayPorts no
